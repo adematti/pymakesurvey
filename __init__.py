@@ -1,9 +1,9 @@
 __version__ = '0.1'
 __author__ = 'Arnaud de Mattia'
-__all__ = ['make_survey','SurveyCatalogue','RandomCatalogue','RandomSkyCatalogue','generate_random_redshifts','DistanceToRedshiftArray','RedshiftDensityMask','RedshiftDensityMask2D','KernelDensityMask','MeshDensityMask','DensityMaskChunk','GeometryMask','Cuboid','distance','cartesian_to_sky','sky_to_cartesian','cutsky_to_box','box_to_cutsky','setup_logging']
+__all__ = ['make_survey','SurveyCatalogue','RandomCatalogue','RandomSkyCatalogue','generate_random_redshifts','DistanceToRedshiftArray','UniformDensityMask','RedshiftDensityMask','RedshiftDensityMask2D','KernelDensityMask','MeshDensityMask','CatalogueMeshDensityMask','DensityMaskChunk','GeometryMask','Cuboid','distance','cartesian_to_sky','sky_to_cartesian','cutsky_to_box','box_to_cutsky','rotation_matrix_from_vectors','setup_logging']
 
-from make_survey import SurveyCatalogue,RandomCatalogue,RandomSkyCatalogue,generate_random_redshifts,DistanceToRedshiftArray
-from make_survey import RedshiftDensityMask,RedshiftDensityMask2D,KernelDensityMask,MeshDensityMask,DensityMaskChunk,GeometryMask,distance,cartesian_to_sky,sky_to_cartesian,cutsky_to_box,box_to_cutsky
+from make_survey import Catalogue,SurveyCatalogue,RandomCatalogue,RandomSkyCatalogue,generate_random_redshifts,DistanceToRedshiftArray
+from make_survey import UniformDensityMask,RedshiftDensityMask,RedshiftDensityMask2D,KernelDensityMask,MeshDensityMask,CatalogueMeshDensityMask,DensityMaskChunk,GeometryMask,distance,cartesian_to_sky,sky_to_cartesian,cutsky_to_box,box_to_cutsky,rotation_matrix_from_vectors
 from remap import Cuboid
 
 import logging

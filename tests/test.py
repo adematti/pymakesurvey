@@ -60,6 +60,15 @@ def test_cutsky():
 	catalogue['distance'],catalogue['RA'],catalogue['DEC'] = catalogue.cartesian_to_sky(wrap=False)
 	for field in ['distance','RA','DEC']: print field, catalogue[field].min(), catalogue[field].max()
 
+def test_redshift_array(nz=4096):
+	from astropy import cosmology
+	cosmo = cosmology.wCDM(H0=0.71,Om0=0.31,Ode0=0.69,w0=-1)
+	zmax = 10.
+	distance = lambda z: cosmo.comoving_distance(z).value*cosmo.h
+	redshift = DistanceToRedshiftArray(distance=distance,zmax=zmax,nz=nz)
+	z = scipy.random.uniform(0.,2.,10000)
+	print scipy.absolute(redshift(distance(z))-z).max()
+
 def test_density():
 
 	n = 100; zrange = [0.6,1.1]
@@ -69,11 +78,29 @@ def test_density():
 	mask = density(z)
 	assert mask[(z>=zrange[0]) & (z<=zrange[0])].all()
 	density.normalize(0.5)
-	assert (density.prob==0.5).all()
-	density.normalize(1.)
-	assert (density.prob==1.).all()
+
+def test_rotation_matrix():
+	def norm(v):
+		return scipy.sqrt(scipy.dot(v,v))
+	a = [1819.25599061,340.48034526,2.1809526 ]
+	b = [0.,0.,1.]
+	rot = rotation_matrix_from_vectors(a,b)
+	print rot
+	print rot.dot(a/norm(a))
+	a = scipy.array([1.,1.,0.])
+	b = scipy.array([2.3,12.,2.])
+	#b = scipy.array([0.,2.,0.])
+	rot = rotation_matrix_from_vectors(a,b)
+	print b/norm(b)
+	print rot.dot(a/norm(a))
+	print rot
+	a = scipy.array([1.,1.,0.])
+	rot = rotation_matrix_from_vectors(a,a)
+	print rot
 
 #test_remap()
 #test_catalogue()
 #test_cutsky()
-test_density()
+#test_density()
+#test_rotation_matrix()
+test_redshift_array()

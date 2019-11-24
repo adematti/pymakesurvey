@@ -1,6 +1,5 @@
 import itertools
 import numpy
-import math
 import logging
 
 def vec3(*args):

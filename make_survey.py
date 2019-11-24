@@ -1,7 +1,28 @@
 import logging
+import collections
+import os
 import scipy
 from scipy import interpolate,optimize,stats,constants
 from remap import Cuboid
+
+def save(path,*args,**kwargs):
+	mkdir(os.path.dirname(path))
+	logger.info('Saving to {}.'.format(path))
+	scipy.save(path,*args,**kwargs)
+
+def rotation_matrix_from_vectors(a,b):
+
+	a = scipy.asarray(a)
+	b = scipy.asarray(b)
+	a /= scipy.linalg.norm(a)
+	b /= scipy.linalg.norm(b)
+	v = scipy.cross(a,b)
+	c = scipy.dot(a,b)
+	s = scipy.linalg.norm(v)
+	I = scipy.identity(3,dtype='f8')
+	k = scipy.array([[0., -v[2], v[1]],[v[2], 0., -v[0]],[-v[1], v[0], 0.]])
+	if s == 0.: return I
+	return I + k + scipy.matmul(k,k) * ((1.-c)/(s**2))
 
 def distance(position):
 	return scipy.sqrt((position**2).sum(axis=-1))
@@ -76,8 +97,8 @@ def cutsky_to_box(drange,rarange,decrange):
 	boxsize[2] = 2.*drange[1]*scipy.sin(deltadec)
 	boxsize[0] = drange[1] - drange[0]*min(scipy.cos(deltara),scipy.cos(deltadec))
 	operations = [{'method':'translate_along_axis','kwargs':{'axis':'x','translate':drange[1]-boxsize[0]/2.}}]
-	operations += [{'method':'rotate_about_origin_axis','kwargs':{'axis':'z','angle':(rarange[0]+rarange[1])/2.}}]
 	operations += [{'method':'rotate_about_origin_axis','kwargs':{'axis':'y','angle':(decrange[0]+decrange[1])/2.}}]
+	operations += [{'method':'rotate_about_origin_axis','kwargs':{'axis':'z','angle':(rarange[0]+rarange[1])/2.}}]
 	return boxsize,operations
 
 def box_to_cutsky(boxsize,dmax):
@@ -139,9 +160,6 @@ class Catalogue(object):
 	logger = logging.getLogger('Catalogue')
 	
 	def __init__(self,columns={},fields=None,**attrs):
-		self.from_dict(columns=columns,fields=fields,**attrs)
-
-	def from_dict(self,columns={},fields=None,**attrs):
 		self.columns = {}
 		if fields is None: fields = columns.keys()
 		for key in fields:
@@ -149,15 +167,14 @@ class Catalogue(object):
 		self.attrs = attrs
 	
 	@classmethod
-	def from_fits(cls,path,ext=1):
+	def from_fits(cls,path,ext=1,**kwargs):
+		from astropy.io import fits
 		self = cls()
 		self.logger.info('Loading catalogue {}.'.format(path))
 		hdulist = fits.open(path,mode='readonly',memmap=True)
 		columns = hdulist[ext].columns
 		
-		new = object.__new__(cls)
-		new.from_dict(hdulist[ext].data,fields=columns.names)
-		return new
+		return cls(columns=hdulist[ext].data,fields=columns.names,**kwargs)
 	
 	@classmethod
 	def from_nbodykit(cls,catalogue,fields=None,allgather=True,**kwargs):
@@ -189,11 +206,8 @@ class Catalogue(object):
 		end = (comm.rank  + 1) * source.size // comm.size
 
 		new = object.__new__(CatalogSource)
-		new.comm = comm
-		new._overrides = {}
-		new.base = None
 		new._size = end - start
-		CatalogSource.__init__(new)
+		CatalogSource.__init__(new,comm=comm)
 		for key in source.fields:
 			new[key] = new.make_column(source[key])[start:end]
 		new.attrs.update(source.attrs)
@@ -233,7 +247,7 @@ class Catalogue(object):
 	
 	def save(self,save,keep=None):
 		pathdir = os.path.dirname(save)
-		utils.mkdir(pathdir)
+		mkdir(pathdir)
 		self.logger.info('Saving {} to {}.'.format(self.__class__.__name__,save))
 		scipy.save(save,self.getstate(keep))
 	
@@ -278,7 +292,7 @@ class Catalogue(object):
 			else:
 				raise KeyError('There is no field {} in the data.'.format(name))
 		else:
-			new = self.copy()
+			new = self.deepcopy()
 			new.columns = {field:self.columns[field][name] for field in self.fields}
 			return new
 	
@@ -400,7 +414,7 @@ class SurveyCatalogue(Catalogue):
 		if not isinstance(axis,int): axis = 'xyz'.index(axis)
 		c,s = scipy.cos(angle),scipy.sin(angle)
 		if axis==0: matrix = [[1.,0.,0.],[0.,c,-s],[0.,s,c]]
-		if axis==1: matrix = [[c,0.,s],[0,1.,0.],[-s,0.,c]]
+		if axis==1: matrix = [[c,0.,-s],[0,1.,0.],[s,0.,c]]
 		if axis==2: matrix = [[c,-s,0],[s,c,0],[0.,0,1.]]
 		matrix = scipy.asarray(matrix)
 		self._rotation = matrix.dot(self._rotation)
@@ -471,6 +485,12 @@ class SurveyCatalogue(Catalogue):
 	
 	def distance(self):
 		return distance(self.Position)
+		
+	def flush(self):
+		self[self.attrs['Position']] = self.Position
+		self[self.attrs['Velocity']] = self.Velocity
+		self._rotation = scipy.eye(self._rotation.shape[0],dtype=self._rotation.dtype)
+		self._boxcenter[:] = self._translation[:]
 	
 	@property
 	def glos(self):
@@ -481,7 +501,10 @@ class SurveyCatalogue(Catalogue):
 		
 	def apply_rsd(self,velocity_offset,los='local'):
 
-		if los == 'local':
+		if not scipy.isscalar(los):
+			unit_vector = scipy.array(los,dtype='f8')
+			unit_vector /= distance(unit_vector)
+		elif los == 'local':
 			unit_vector = self.Position/distance(self.Position)[:,None]
 		elif los == 'global':
 			unit_vector = self.glos
@@ -505,9 +528,7 @@ class SurveyCatalogue(Catalogue):
 		for i,r in enumerate(ranges): mask &= (position[:,i] >= r[0]) & (position[:,i] <= r[1])
 		new = self[mask]
 		new.BoxSize = scipy.diff(ranges,axis=-1)[:,0]
-		new._boxcenter = scipy.array([r[0] for r in ranges],dtype=scipy.float64) + new.BoxSize/2.
-		new._translation += new._boxcenter - self._boxcenter
-		new._compute_position = True
+		new._boxcenter = scipy.array([r[0] for r in ranges],dtype=scipy.float64) + new.BoxSize/2. + self._boxcenter - self._translation
 		return new
 	
 	def apply_operation(self,*operations):
@@ -518,12 +539,13 @@ class SurveyCatalogue(Catalogue):
 		factors[:] = factor
 		new = self.deepcopy()
 		new.BoxSize *= factors
-		if self.attrs['Position'] not in replicate: replicate.append(self.attrs['Position'])
+		position = self.attrs['Position']
+		if position not in replicate: replicate.append(position)
 		shifts = [scipy.arange(-scipy.ceil(factor)+1,scipy.ceil(factor)) for factor in factors]
 		columns = {key:[] for key in new}
 		for shift in cartesian(shifts):
 			tmp = {key: self[key] + self.BoxSize*shift for key in replicate}
-			mask = (tmp[self.attrs['Position']] >= -new.BoxSize/2. + self._boxcenter) & (tmp[self.attrs['Position']] <= new.BoxSize/2. + self._boxcenter)
+			mask = (tmp[position] >= -new.BoxSize/2. + self._boxcenter) & (tmp[position] <= new.BoxSize/2. + self._boxcenter)
 			mask = scipy.all(mask,axis=-1)
 			for key in new:
 				if key in replicate: columns[key].append(tmp[key][mask])
@@ -583,7 +605,7 @@ def generate_random_redshifts(redshift_density,redshift_to_distance,size=100,fac
 	assert (prob <= 1.).all()
 	mask_redshift = (prob >= rng.uniform(0.,1.,redshift.size)) & redshift_density(redshift)
 	nmask_redshift = mask_redshift.sum()
-	assert nmask_redshift >= size, 'You should set factor {:.4g}.'.format(factor*len(mask_redshift)*1./nmask_redshift*1.1)
+	assert nmask_redshift >= size, 'You should set factor {:.5g}.'.format(factor*len(mask_redshift)*1./nmask_redshift*1.1)
 	
 	if exact: return redshift[mask_redshift][:size]
 	return redshift[mask_redshift]
@@ -600,15 +622,35 @@ class DistanceToRedshiftArray(object):
 		zgrid = scipy.logspace(-8,scipy.log10(self.zmax),self.nz)
 		self.zgrid = scipy.concatenate([[0.], zgrid])
 		self.rgrid = self.distance(self.zgrid)
-		self.spline = self.get_spline()
+		self.set_interp()
 
-	def get_spline(self):
-		return interpolate.Akima1DInterpolator(self.rgrid,self.zgrid,axis=0)
+	def set_interp(self):
+		self.interp = interpolate.Akima1DInterpolator(self.rgrid,self.zgrid,axis=0)
 
 	def __call__(self,distance):
-		return self.spline(distance)
+		return self.interp(distance)
 
-class RedshiftDensityMask(object):
+
+class UniformDensityMask(object):
+
+	logger = logging.getLogger('UniformDensityMask')
+
+	def __init__(self,nbar=1.,rng=None,seed=None):
+		self.nbar = nbar
+		self.set_rng(rng=rng,seed=seed)
+
+	def set_rng(self,rng=None,seed=None):
+		if rng is None: rng = scipy.random.RandomState(seed=seed)
+		self.rng = rng
+
+	def prob(self,z,*args,**kwargs):
+		return scipy.clip(self.nbar,0.,1.)*scipy.ones(z.shape[-1],dtype='f8')
+
+	def __call__(self,z):
+		tmp = self.prob(z)
+		return tmp >= self.rng.uniform(low=0.,high=1.,size=len(tmp))
+
+class RedshiftDensityMask(UniformDensityMask):
 	
 	logger = logging.getLogger('RedshiftDensityMask')
 	
@@ -626,84 +668,69 @@ class RedshiftDensityMask(object):
 			raise ValueError('Redshift range is {:.2f} - {:.2f} when you ask for {:.2f} - {:.2f}.'.format(zmin,zmax,self.zrange[0],self.zrange[1]))
 		self.set_rng(rng=rng,seed=seed)
 		self.prepare(norm=norm)
-	
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
-
-	@property
-	def zmask(self):
-		return (self.z >= self.zrange[0]) & (self.z <= self.zrange[1])
-
-	def get_spline(self,prob):
-		return interpolate.Akima1DInterpolator(self.z,prob,axis=0)
 
 	def prepare(self,norm=None):
 		if norm is None: norm = 1./self.nbar[self.zmask].max(axis=0)
-		self.set_prob(self.nbar*norm)
 		self.norm = norm
+		self.set_interp()
 		return self.norm
-	
-	def set_prob(self,prob):
-		self.prob = scipy.clip(prob,0.,1.)
-		self.spline = self.get_spline(self.prob)
+
+	@property
+	def zmask(self):
+		return (self.z >= self.zrange[0]) & (self.z <= self.zrange[-1])
+
+	def set_interp(self):
+		prob = scipy.clip(self.norm*self.nbar,0.,1.)
+		self.interp = interpolate.Akima1DInterpolator(self.z,prob,axis=0)
+
+	def prob(self,z):
+		toret = self.interp(z)
+		mask = (z >= self.zrange[0]) & (z <= self.zrange[-1])
+		toret[~mask] = 0.
+		return toret
 	
 	def flatten(self,norm=None):
 		if norm is None: norm = self.nbar[self.zmask].sum()
 		self.nbar = scipy.ones_like(self.nbar)
 		self.prepare(norm=self.zmask.sum()/norm)
 	
-	def integral(self):
-		return self.spline.integrate(self.zrange[0],self.zrange[1])
-	
-	def integral_distrib(self,distrib=lambda z: scipy.ones_like(z)):
-		z = scipy.linspace(self.zrange[0],self.zrange[1],1000)
-		distribz = distrib(z)
-		return scipy.mean(self.spline(z)*distribz)/scipy.mean(distribz)
-	
-	"""
-	def normalize(self,factor=1.,distrib=lambda z: scipy.ones_like(z)):
+	def integral(self,z=None,w=None,npoints=1000,normalize=True):
+		if z is None and w is None:
+			return self.interp.integrate(self.zrange[0],self.zrange[1])
+		z,w = self._get_zw_(z=z,w=w,npoints=npoints,normalize=normalize)
+		return self._integral_(z,w)
+
+	def _get_zw_(self,z=None,w=None,npoints=1000,normalize=True):
+		if z is None:
+			z = scipy.linspace(self.zrange[0],self.zrange[1],npoints)
+		if w is None:
+			w = 1.
+			if normalize: w = w/len(z)
+			return z,w
+		if not isinstance(w,(scipy.ndarray,list)):
+			w = w(z)
+		if normalize: w = w/w.sum()
+		return z,w
+
+	def _integral_(self,z,w):
+		return scipy.sum(self.prob(z)*w)
+
+	def normalize(self,factor=1.,**kwargs):
 
 		assert factor <= 1.
-
-		z = scipy.linspace(self.zrange[0],self.zrange[1],1000)
-		distribz = distrib(z)
-		distribz /= scipy.mean(distribz)
-		prob = self.spline(z)*distribz
-		
-		def normalization(norm):
-			#spline = self.get_spline(scipy.clip(norm*self.prob,0.,1.))
-			#return spline.integrate(self.zrange[0],self.zrange[1])/(self.zrange[1]-self.zrange[0])/factor - 1
-			return scipy.mean(scipy.clip(norm*prob,0.,1.))/factor - 1
-		
-		min_ = prob[prob>0.].min()
-		norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.
-		self.prob = scipy.clip(norm*self.prob,0.,1.)
-		self.spline = self.get_spline(self.prob)
-		self.logger.info('Expected error: {:.4f}.'.format(scipy.mean(self.spline(z)*distribz)-factor))
-	"""
-	def normalize(self,factor=1.,distrib=lambda z: scipy.ones_like(z)):
-
-		assert factor <= 1.
-
-		norm_nbar = self.prepare()
-
-		z = scipy.linspace(self.zrange[0],self.zrange[1],1000)
-		distribz = distrib(z)
-		distribz /= scipy.mean(distribz)
-		
-		def rescaled_prob(norm):
-			return scipy.clip(norm*self.prob,0.,1.)
+		z,w = self._get_zw_(normalize=True,**kwargs)
 
 		def normalization(norm):
-			return scipy.mean(self.get_spline(rescaled_prob(norm))(z)*distribz)/factor - 1
+			self.norm = norm
+			self.set_interp()
+			return self._integral_(z,w)/factor - 1.
 
-		min_ = self.prob[self.prob>0.].min()
+		min_ = self.nbar[self.nbar>0.].min()
 		norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.
 		
-		norm *= norm_nbar
 		self.prepare(norm=norm)
-		self.logger.info('Expected error: {:.2g}.'.format(scipy.mean(self.spline(z)*distribz)-factor))
+		self.logger.info('Norm is: {:.12g}.'.format(self.norm))
+		self.logger.info('Expected error: {:.5g}.'.format(self._integral_(z,w)-factor))
 		
 		return norm
 	
@@ -725,10 +752,10 @@ class RedshiftDensityMask(object):
 		self.prepare()
 
 	def __call__(self,z):
-		return (z >= self.zrange[0]) & (z <= self.zrange[-1]) & (self.spline(z) >= self.rng.uniform(low=0.,high=1.,size=len(z)))
+		tmp = self.prob(z)
+		return tmp >= self.rng.uniform(low=0.,high=1.,size=len(tmp))
 
-
-class RedshiftDensityMask2D(object):
+class RedshiftDensityMask2D(RedshiftDensityMask):
 	
 	logger = logging.getLogger('RedshiftDensityMask2D')
 	
@@ -742,59 +769,56 @@ class RedshiftDensityMask2D(object):
 			raise ValueError('Redshift range in {} is {:.2f} - {:.2f} when you ask for {:.2f} - {:.2f}.'.format(path,zmin,zmax,self.zrange[0],self.zrange[1]))
 		self.set_rng(rng=rng,seed=seed)
 		self.prepare(norm=norm)
-	
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
-	
-	@property
-	def zmask(self):
-		return (self.z >= self.zrange[0]) & (self.z <= self.zrange[1])
-		
-	def get_spline(self,prob):
-		return interpolate.RectBivariateSpline(self.z,self.other,prob,bbox=[None,None,None,None],kx=3,ky=3,s=0)
 
-	def prepare(self,norm=None):
-		if norm is None: norm = 1./self.nbar[self.zmask].max(axis=0)
-		self.set_prob(self.nbar*norm)
-		return norm
-	
-	def set_prob(self,prob):
-		self.prob = scipy.clip(prob,0.,1.)
-		self.spline = self.get_spline(self.prob)
+	def set_interp(self):
+		prob = scipy.clip(self.norm*self.nbar,0.,1.)
+		self.interp = interpolate.RectBivariateSpline(self.z,self.other,prob,bbox=[None,None,None,None],kx=3,ky=3,s=0)
 
-	def normalize(self,factor=1.,distrib=lambda (z,other): scipy.ones(z.shape[:1]+other.shape[1:],dtype='f8'),range_other=[0.,1.]):
+	def prob(self,z,grid=False):
+		z,other = z
+		toret = self.interp(z,other,grid=grid)
+		mask = (z >= self.zrange[0]) & (z <= self.zrange[-1])
+		toret[~mask] = 0.
+		return toret
+
+	def _get_zw_(self,z=None,w=None,npoints=1000,onpoints=10,orange=[0.,1.],grid=False,normalize=True):
+		if z is None:
+			z = [scipy.linspace(self.zrange[0],self.zrange[1],npoints),scipy.linspace(range_other[0],range_other[1],onpoints)]
+			grid = True
+		if w is None:
+			w = 1.
+			if normalize:
+				if grid: w = w/(len(z[0])+len(z[1]))
+				else: w = w/len(z)
+			return z,w,grid
+		if not isinstance(w,(scipy.ndarray,list)):
+			w = w(z)
+		if normalize: w = w/w.sum()
+		return z,w,grid
+
+	def _integral_(self,z,w,grid=False):
+		return scipy.sum(self.prob(z,grid=grid)*w)
+
+	def normalize(self,factor=1.,**kwargs):
 
 		assert factor <= 1.
-		
-		norm_nbar = self.prepare()
-
-		z = scipy.linspace(self.zrange[0],self.zrange[1],1000)
-		other = scipy.linspace(range_other[0],range_other[1],10)
-		distribz = distrib((z,other))
-		distribz /= scipy.mean(distribz)
-		
-		def rescaled_prob(norm):
-			return scipy.clip(norm*self.prob,0.,1.)
+		z,w,grid = self._get_zw_(normalize=True,**kwargs)
 
 		def normalization(norm):
-			spline = self.get_spline(rescaled_prob(norm))
-			return scipy.mean(spline(z,other,grid=True)*distribz)/factor - 1
+			self.norm = norm
+			self.set_interp()
+			return self._integral_(z,w,grid=grid)/factor - 1
 
 		min_ = self.prob[self.prob>0.].min()
 		norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.
 		
-		norm *= norm_nbar
 		self.prepare(norm=norm)
-		self.logger.info('Expected error: {:.2g}.'.format(scipy.mean(self.spline(z,other,grid=True)*distribz)-factor))
+		self.logger.info('Norm is: {:.12g}.'.format(self.norm))
+		self.logger.info('Expected error: {:.5g}.'.format(self._integral_(z,w,grid=grid)-factor))
 		
 		return norm
 
-	def __call__(self,zother):
-		z,other = z,other
-		return (z >= self.zrange[0]) & (z <= self.zrange[-1]) & (self.spline(z,other,grid=False) >= self.rng.uniform(low=0.,high=1.,size=len(z)))
-
-class KernelDensityMask(object):
+class KernelDensityMask(RedshiftDensityMask):
 
 	logger = logging.getLogger('KernelDensityMask')
 	
@@ -805,302 +829,304 @@ class KernelDensityMask(object):
 		self.zrange = zrange
 		self.set_rng(rng=rng,seed=seed)
 		self.kernel = KernelDensity(**kwargs)
-		self.kernel.fit(self.convert_position(position),sample_weight=weight)
+		self.kernel.fit(self.get_position(position),sample_weight=weight)
 		self.norm = norm
 	
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
-
-	def convert_position(self,position):
+	def get_position(self,position):
 		if self.distance is not None:
 			z,ra,dec = position
 			position = sky_to_cartesian(self.distance(z),ra,dec).T
 		return position.T
 
-	def prob(self,position):
+	def prob(self,position,clip=True):
 		if self.distance is not None:
 			z,ra,dec = position
-		logpdf = self.kernel.score_samples(self.convert_position(position))
+		logpdf = self.kernel.score_samples(self.get_position(position))
 		toret = self.norm*scipy.exp(logpdf)
+		if clip: toret = scipy.clip(toret,0.,1.)
 		if self.distance is not None and self.zrange is not None:
 			mask = (z >= self.zrange[0]) & (z <= self.zrange[-1])
 			toret[~mask] = 0.
 		return toret
 
-	def integral(self,position):
-		return scipy.sum(scipy.clip(self.prob(position),0.,1.))
+	def integral(self,position,normalize=True):
+		toret = scipy.sum(self.prob(position))
+		if normalize: toret /= position.shape[-1]
 	
-	def normalize_samples(self,position,factor=1.):
+	def normalize(self,position,factor=1.):
 
 		assert factor <= 1.
-		prob = self.prob(position)
-		size = position.shape[-1]
-		
-		def rescaled_prob(norm):
-			return scipy.clip(norm*prob,0.,1.)
+		prob = self.prob(position,clip=False)
 
 		def normalization(norm):
-			return scipy.sum(rescaled_prob(norm))/(size*factor) - 1.
+			return scipy.sum(scipy.clip(norm*prob,0.,1.))/(size*factor) - 1.
 
 		min_ = prob[prob>0.].min()
 		self.norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.
 		
-		self.logger.info('Expected error: {:.2g}.'.format(self.integral(position)/size-factor))
+		self.logger.info('Norm is: {:.12g}.'.format(self.norm))
+		self.logger.info('Expected error: {:.5g}.'.format(self.integral(position,normalize=True)-factor))
 		
 		return self.norm
 
-	def __call__(self,position):
-		return self.prob(position) >= self.rng.uniform(low=0.,high=1.,size=position.shape[-1])
-
-
-class MeshDensityMask(object):
+class MeshDensityMask(RedshiftDensityMask):
 
 	logger = logging.getLogger('MeshDensityMask')
 
-	def __init__(self,position,weight=None,distance=None,zrange=None,norm=1.,rng=None,seed=None,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02,resampler='tsc',**kwargs):
-		from nbodykit.lab import ArrayCatalog
+	def __init__(self,mesh,distance=None,zrange=None,norm=None,rng=None,seed=None,BoxSize=None,BoxCenter=None,dlos=None,mlos=[0.,0.,1.],**kwargs):
+		
 		self.distance = distance
 		self.zrange = zrange
 		self.set_rng(rng=rng,seed=seed)
-		self.BoxCenter = 0.
-		position = self.convert_position(position)
-		Nmesh,BoxSize = self.define_cartesian_box(position,Nmesh=Nmesh,BoxSize=BoxSize,CellSize=CellSize,BoxCenter=BoxCenter,BoxPad=BoxPad)
-		catalog = ArrayCatalog({'Position':position-self.BoxCenter,'Weight':weight})
-		self.mesh = catalog.to_mesh(Nmesh=Nmesh,BoxSize=BoxSize,resampler=resampler)
-		self.set_interp()
-		self.norm = norm
+		self.define_rotation_matrix_from_vectors(dlos=dlos,mlos=mlos)
+		BoxSize = self.define_cartesian_box_from_boxsize(BoxSize,BoxCenter)
+		from nbodykit.lab import ArrayMesh
+		self.mesh = ArrayMesh(mesh,BoxSize=BoxSize).to_real_field()
+		self.prepare(norm=norm)
 
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
-	
+	@classmethod
+	def from_nbodykit(cls,mesh,distance=None,zrange=None,norm=None,rng=None,seed=None,**kwargs):
+		kwargs_ = {}
+		kwargs_.update(mesh.attrs)
+		kwargs_.update(kwargs)
+		return cls(mesh.to_real_field().value,distance=distance,zrange=zrange,norm=norm,rng=rng,seed=seed,**kwargs_)
+
+	def recenter(self,position,weight=None,mlos=[0.,0.,1.],BoxPad=0.):
+		position = self.cartesian_transform(position)
+		#print self.rotation
+		self.define_rotation_matrix_from_position(position,weight=weight,mlos=mlos)
+		self.offset = 0.; position = self.affine_transform(position)
+		pos_min, pos_max = position.min(axis=0),position.max(axis=0)
+		delta = abs(pos_max - pos_min)
+		BoxCenter = 0.5 * (pos_min + pos_max)
+		delta *= 1.0 + BoxPad
+		if (self.BoxSize < delta).any(): raise ValueError('BoxSize too small to contain all data.')
+		self.define_cartesian_box_from_boxsize(self.BoxSize,BoxCenter)
+		self.prepare(norm=self.norm)
+
+	def prepare(self,norm=None):
+		if norm is None: norm = 1./self.max()
+		self.norm = norm
+		self.set_interp()
+		return norm
+
 	@property
 	def Nmesh(self):
-		return self.mesh.pm.Nmesh
+		return self.mesh.Nmesh
 
 	@property
 	def BoxSize(self):
-		return self.mesh.pm.BoxSize
+		return self.mesh.BoxSize
 
 	def xgrid(self):
-		#return [scipy.linspace(-boxsize/2.,boxsize/2.,nmesh) for nmesh,boxsize in zip(self.Nmesh,self.BoxSize)]
-		return [scipy.linspace(0,boxsize,nmesh) for nmesh,boxsize in zip(self.Nmesh,self.BoxSize)]
+		return [scipy.linspace(0.,boxsize,nmesh) for nmesh,boxsize in zip(self.Nmesh,self.BoxSize)]
 
-	def define_cartesian_box(self,position,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02):
-		pos_min, pos_max = position.min(axis=0),position.max(axis=0)
-		delta = abs(pos_max - pos_min)
-		if BoxCenter is None: BoxCenter = 0.5 * (pos_min + pos_max)
-		if BoxSize is None:
-			delta *= 1.0 + BoxPad
-			BoxSize = scipy.ceil(delta) # round up to nearest integer
-		if (BoxSize < delta).any(): raise ValueError('BoxSize too small to contain all data.')
-		if CellSize is not None:
-			Nmesh = scipy.ceil(BoxSize/CellSize).astype(int) + 1
-		self.BoxCenter = BoxCenter - BoxSize/2.
-		return Nmesh,BoxSize
+	def max(self):
+		return max(self.mesh.pm.comm.allgather(self.mesh.value.max()))
+	
+	def sum(self):
+		return self.mesh.csum()
 
-	def filter_gaussian(self,cov=1.):
+	def std(self):
+		return scipy.sqrt((self.mesh**2).cmean()-self.mesh.cmean()**2)
+
+	def abssum(self):
+		return abs(self.sum())
+
+	def define_rotation_matrix_from_vectors(self,dlos,mlos=[0.,0.,1.]):
+		self.rotation = rotation_matrix_from_vectors(dlos,mlos)
+
+	def define_cartesian_box_from_boxsize(self,BoxSize,BoxCenter):
+		BoxSize_ = scipy.empty(3,dtype='f8')
+		BoxSize_[:] = BoxSize
+		BoxCenter_ = scipy.empty(3,dtype='f8')
+		BoxCenter_[:] = BoxCenter
+		self.offset = BoxCenter_ - BoxSize_/2.
+		return BoxSize_
+
+	def define_rotation_matrix_from_position(self,position,weight=None,mlos=[0.,0.,1.]):
+		dlos = scipy.average(position,weights=weight,axis=0)
+		self.define_rotation_matrix_from_vectors(dlos=dlos,mlos=mlos)
+
+	def filter_gaussian(self,cov=1.,offset=0.):
 		covariance = scipy.zeros(3,dtype='f8')
 		covariance[:] = cov
 		def filter(k,v):
 			return v*scipy.exp(sum(-ki**2/2./cov for ki,cov in zip(k,covariance)))
-		self.mesh = self.mesh.apply(filter,mode='complex',kind='wavenumber')
-		self.mesh = self.mesh.paint(mode='real')
+		self.filter_generic(filter,offset=offset)
+
+	def filter_generic(self,filter,offset=0.):
+		mesh = (self.mesh+offset).r2c(out=Ellipsis).apply(filter,kind='wavenumber')
+		self.mesh = mesh.c2r(out=Ellipsis)-offset
 		self.set_interp()
 
-	def convert_position(self,position):
+	def affine_transform(self,position):
+		return scipy.tensordot(position,self.rotation,axes=((1,),(1,))) - self.offset
+
+	def cartesian_transform(self,position):
 		if self.distance is not None:
 			z,ra,dec = position
-			position = sky_to_cartesian(self.distance(z),ra,dec).T
-		return position.T - self.BoxCenter
+			return sky_to_cartesian(self.distance(z),ra,dec)
+		else:
+			return position.T
+
+	def get_position(self,position):
+		return self.affine_transform(self.cartesian_transform(position))
 
 	def set_interp(self):
-		mesh = self.mesh.preview()
-		xgrid = self.xgrid()
-		self.interp = interpolate.RegularGridInterpolator(xgrid,mesh,bounds_error=False,fill_value=0.)
+		self.interp = interpolate.RegularGridInterpolator(self.xgrid(),self.mesh,bounds_error=True,fill_value=0.)
 
-	def show(self,axes=[0,1],**kwargs):
-		from matplotlib import pyplot
-		field = self.mesh
-		pyplot.imshow(self.mesh.preview(axes=axes,**kwargs).T,origin='lower',extent=(0,self.BoxSize[axes[0]],0,self.BoxSize[axes[1]]))
-		pyplot.show()
-
-	def prob(self,position):
+	def prob(self,position,clip=True):
 		if self.distance is not None:
 			z,ra,dec = position
-		toret = self.norm*self.interp(self.convert_position(position))
+		toret = scipy.zeros(len(z),dtype='f8')
 		if self.distance is not None and self.zrange is not None:
 			mask = (z >= self.zrange[0]) & (z <= self.zrange[-1])
-			toret[~mask] = 0.
-
+		else:
+			mask = scipy.ones_like(toret,dtype=scipy.bool_)
+		#position_ = self.cartesian_transform(position)[mask]
+		#print position_.min(axis=0), position_.max(axis=0) 
+		toret[mask] = self.norm*self.interp(self.get_position(position)[mask])
+		if clip: toret = scipy.clip(toret,0.,1.)
 		return toret
 
-	def integral(self,position):
-		return scipy.sum(scipy.clip(self.prob(position),0.,1.))
+	def integral(self,position,normalize=True):
+		toret = scipy.sum(self.prob(position))
+		if normalize: toret /= position.shape[-1]
 	
-	def normalize_samples(self,position,factor=1.):
+	def normalize(self,position,factor=1.):
 
 		assert factor <= 1.
-		prob = self.prob(position)
-		print prob.min(),prob.max()
-		size = position.shape[-1]
-		
-		def rescaled_prob(norm):
-			return scipy.clip(norm*prob,0.,1.)
+		prob = self.prob(position,clip=False)
 
 		def normalization(norm):
-			return scipy.sum(rescaled_prob(norm))/(size*factor) - 1.
+			return scipy.sum(scipy.clip(norm*prob,0.,1.))/(size*factor) - 1.
 
 		min_ = prob[prob>0.].min()
-		self.norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.		
-
-		self.logger.info('Expected error: {:.2g}.'.format(self.integral(position)/size-factor))
+		self.norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.
+		
+		self.logger.info('Norm is: {:.12g}.'.format(self.norm))
+		self.logger.info('Expected error: {:.5g}.'.format(self.integral(position,normalize=True)-factor))
 		
 		return self.norm
-
-	def __call__(self,position):
-		return self.prob(position) >= self.rng.uniform(low=0.,high=1.,size=position.shape[-1])
-
-"""
-class MeshDensityMask(object):
-
-	logger = logging.getLogger('MeshDensityMask')
-
-	def __init__(self,position,weight=None,distance=None,zrange=None,norm=1.,rng=None,seed=None,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02,resampler='tsc',**kwargs):
-		from nbodykit.lab import ArrayCatalog
-		self.distance = distance
-		self.zrange = zrange
-		self.set_rng(rng=rng,seed=seed)
-		self.BoxCenter = 0.
-		position = self.convert_position(position)
-		Nmesh,BoxSize = self.define_cartesian_box(position,Nmesh=Nmesh,BoxSize=BoxSize,CellSize=CellSize,BoxCenter=BoxCenter,BoxPad=BoxPad)
-		catalog =  self._to_nbodykit_(self,position,weight=weight)
-		self.base = catalog.to_mesh(Nmesh=Nmesh,BoxSize=BoxSize,resampler=resampler).compute()
-		self.fluctuations = None
-		self.set_interp()
-		self.norm = norm
-
-	
-	def _to_nbodykit_(self,position,weight=None):
-		dict_ = {'Position':position}
-		if weight is not None: dict_.update(Weight=weight)
-		return ArrayCatalog({'Position':position,'Weight':weight})
-		
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
-	
-	@property
-	def Nmesh(self):
-		return self.base.Nmesh
-
-	@property
-	def BoxSize(self):
-		return self.base.BoxSize
-
-	def xgrid(self):
-		#return [scipy.linspace(-boxsize/2.,boxsize/2.,nmesh) for nmesh,boxsize in zip(self.Nmesh,self.BoxSize)]
-		return [scipy.linspace(0,boxsize,nmesh) for nmesh,boxsize in zip(self.Nmesh,self.BoxSize)]
-
-	def define_cartesian_box(self,position,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02):
-		pos_min, pos_max = position.min(axis=0),position.max(axis=0)
-		delta = abs(pos_max - pos_min)
-		if BoxCenter is None: BoxCenter = 0.5 * (pos_min + pos_max)
-		if BoxSize is None:
-			delta *= 1.0 + BoxPad
-			BoxSize = scipy.ceil(delta) # round up to nearest integer
-		if (BoxSize < delta).any(): raise ValueError('BoxSize too small to contain all data.')
-		if CellSize is not None:
-			Nmesh = scipy.ceil(BoxSize/CellSize).astype(int) + 1
-		self.BoxCenter = BoxCenter - BoxSize/2.
-		return Nmesh,BoxSize
-
-	def set_fluctuations(self,position1,position2,weight1=None,weight2=None,resampler='tsc'):
-		catalog = self._to_nbodykit_(self,position1,weight=weight1)
-		mesh1 = catalog.to_mesh(Nmesh=self.Nmesh,BoxSize=self.BoxSize,resampler=resampler).compute()
-		catalog = self._to_nbodykit_(self,position2,weight=weight2)
-		mesh2 = catalog.to_mesh(Nmesh=self.Nmesh,BoxSize=self.BoxSize,resampler=resampler).compute()
-		self.fluctuations = self.base.csum()*(self.mesh1/self.mesh1.csum() - mesh2/mesh2.sum())
-
-	def filter_gaussian(self,which=None,cov=1.):
-		covariance = scipy.zeros(3,dtype='f8')
-		covariance[:] = cov
-		def filter(k,v):
-			return v*scipy.exp(sum(-ki**2/2./cov for ki,cov in zip(k,covariance)))
-		if which is None:
-			which = 'fluctuations' if self.fluctuations is not None else 'base'
-		mesh = getattr(self,which)
-		mesh = mesh.r2c(out=Ellipsis).apply(filter,kind='wavenumber')
-		mesh = mesh.c2r(out=Ellipsis)
-		self.set_interp()
-
-	def convert_position(self,position):
-		if self.distance is not None:
-			z,ra,dec = position
-			position = sky_to_cartesian(self.distance(z),ra,dec).T
-		return position.T - self.BoxCenter
-
-	def set_interp(self):
-		mesh = self.base
-		xgrid = self.xgrid()
-		if self.fluctuations is not None:
-			mesh = mesh - self.fluctuations
-		self.interp = interpolate.RegularGridInterpolator(xgrid,mesh,bounds_error=False,fill_value=0.)
 
 	def show(self,which=None,axes=[0,1],**kwargs):
 		from matplotlib import pyplot
-		if which is None:
-			which = 'fluctuations' if self.fluctuations is not None else 'base'
-		pyplot.imshow(self.base.preview(axes=axes,**kwargs).T,origin='lower',extent=(0,self.BoxSize[axes[0]],0,self.BoxSize[axes[1]]))
+		pyplot.imshow(self.mesh.preview(axes=axes,**kwargs).T,origin='lower',extent=(0,self.BoxSize[axes[0]],0,self.BoxSize[axes[1]]))
+		pyplot.colorbar()
 		pyplot.show()
 
-	def prob(self,position):
-		if self.distance is not None:
-			z,ra,dec = position
-		toret = self.norm*self.interp(self.convert_position(position))
-		if self.distance is not None and self.zrange is not None:
-			mask = (z >= self.zrange[0]) & (z <= self.zrange[-1])
-			toret[~mask] = 0.
+	def deepcopy(self):
+		new = object.__new__(self.__class__)
+		new.__dict__.update(self.__dict__)
+		new.offset = self.offset.copy()
+		new.mesh = self.mesh.copy()
+		new.set_interp()
+		return new
 
-		return toret
+	def clip(self,amin,amax):
+		self.mesh[self.mesh<amin] = amin
+		self.mesh[self.mesh>amax] = amax
 
-	def integral(self,position):
-		return scipy.sum(scipy.clip(self.prob(position),0.,1.))
+	def __mul__(self,other):
+		new = self.deepcopy()
+		if not isinstance(other,self.__class__):
+			new.mesh *= other			
+			return new
+		assert scipy.all(self.Nmesh == other.Nmesh)
+		new.mesh = new.mesh*other.mesh
+		new.set_interp()
+		return new
+
+	def __div__(self,other):
+		new = self.deepcopy()
+		if not isinstance(other,self.__class__):
+			new.mesh /= other			
+			return new
+		assert scipy.all(self.Nmesh == other.Nmesh)
+		new.mesh = self.mesh/other.mesh
+		new.mesh[other.mesh==0.] = self.sum()/other.sum()
+		new.set_interp()
+		return new
 	
-	def normalize_samples(self,position,factor=1.):
+	def __add__(self,other):
+		new = self.deepcopy()
+		if not isinstance(other,self.__class__):
+			new.mesh += other			
+			return new
+		assert scipy.all(self.Nmesh == other.Nmesh)
+		new.mesh = self.mesh + other.mesh
+		new.set_interp()
+		return new
 
-		assert factor <= 1.
-		prob = self.prob(position)
-		size = position.shape[-1]
+	def __neg__(self):
+		new = self.deepcopy()
+		new.mesh *= -1
+		return new
+
+	def __sub__(self,other):
+		return self.__add__(other.__neg__())
+
+
+class CatalogueMeshDensityMask(MeshDensityMask):
+
+	logger = logging.getLogger('CatalogueMeshDensityMask')
+
+	def __init__(self,position,weight=None,distance=None,zrange=None,norm=None,rng=None,seed=None,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02,resampler='tsc',**kwargs):
 		
-		def rescaled_prob(norm):
-			return scipy.clip(norm*prob,0.,1.)
+		self.distance = distance
+		self.zrange = zrange
+		self.set_rng(rng=rng,seed=seed)
+		position = self.cartesian_transform(position)
+		self.define_rotation_matrix_from_position(position,weight=weight)
+		self.offset = 0.; position = self.affine_transform(position)
+		Nmesh,BoxSize = self.define_cartesian_box_from_position(position,Nmesh=Nmesh,BoxSize=BoxSize,CellSize=CellSize,BoxCenter=BoxCenter,BoxPad=BoxPad)
+		catalog = self._catalogue_to_nbodykit_(position-self.offset,weight=weight)
+		self.mesh = catalog.to_mesh(Nmesh=Nmesh,BoxSize=BoxSize,resampler=resampler).to_real_field(normalize=False)
+		self.prepare(norm=norm)
+	
+	def _catalogue_to_nbodykit_(self,position,weight=None):
+		from nbodykit.lab import ArrayCatalog
+		dict_ = {'Position':position}
+		if weight is not None: dict_.update(Weight=weight)
+		return ArrayCatalog({'Position':position,'Weight':weight})
 
-		def normalization(norm):
-			return scipy.sum(rescaled_prob(norm))/(size*factor) - 1.
+	def define_cartesian_box_from_position(self,position,Nmesh=256,BoxSize=None,CellSize=None,BoxCenter=None,BoxPad=0.02):
+		pos_min, pos_max = position.min(axis=0),position.max(axis=0)
+		delta = abs(pos_max - pos_min)
+		if BoxCenter is None: BoxCenter = 0.5 * (pos_min + pos_max)
+		if BoxSize is None:
+			BoxSize = delta * (1.0 + BoxPad)
+		if (BoxSize < delta).any(): raise ValueError('BoxSize too small to contain all data.')
+		if CellSize is not None:
+			Nmesh = scipy.ceil(BoxSize/CellSize).astype(int) + 1
+		BoxSize = self.define_cartesian_box_from_boxsize(BoxSize,BoxCenter)
+		return Nmesh,BoxSize
 
-		min_ = prob[prob>0.].min()
-		self.norm = optimize.brentq(normalization,0.,1/min_) # the lowest point of n(z) is limited by 1.		
+	def clone(self,position,weight=None,resampler='tsc',norm=None):
+		new = object.__new__(self.__class__)
+		new.__dict__.update(self.__dict__)
+		new.offset = self.offset.copy()
+		catalog = self._catalogue_to_nbodykit_(self.get_position(position),weight=weight)
+		new.mesh = catalog.to_mesh(Nmesh=self.Nmesh,BoxSize=self.BoxSize,resampler=resampler).to_real_field(normalize=False)
+		new.set_interp()
+		new.prepare(norm=norm)
+		return new
 
-		self.logger.info('Expected error: {:.2g}.'.format(self.integral(position)/size-factor))
-		
-		return self.norm
+	@classmethod
+	def from_mesh(cls,mesh):
+		new = object.__new__(cls)
+		new.__dict__.update(mesh.__dict__)
+		new.offset = new.offset.copy()
+		return new
 
-	def __call__(self,position):
-		return self.prob(position) >= self.rng.uniform(low=0.,high=1.,size=position.shape[-1])
-"""
 class DensityMaskChunk(object):
 
 	def __init__(self):
-		self.density_mask = {}
+		self.density_mask = collections.OrderedDict()
 		
 	def __iter__(self):
 		return self.density_mask.__iter__()
-	
-	def set_rng(self,rng=None,seed=None):
-		if rng is None: rng = scipy.random.RandomState(seed=seed)
-		self.rng = rng
 		
 	def set_rng(self,rng=None,seed=None):
 		for chunkz,density in self.items():
@@ -1130,7 +1156,8 @@ class DensityMaskChunk(object):
 		toret = scipy.ones(z.shape[-1],dtype=scipy.bool_)
 		for ichunkz,density in self.items():
 			mask = other == ichunkz
-			toret[...,mask] = density(z[...,mask])
+			if mask.any():
+				toret[...,mask] = density(z[...,mask])
 		return toret
 
 	def __radd__(self,other):
